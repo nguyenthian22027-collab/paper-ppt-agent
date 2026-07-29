@@ -1,0 +1,206 @@
+"""Helpers for slide-structured manuscript Markdown."""
+
+from __future__ import annotations
+
+import re
+
+_SLIDE_DELIMITER_RE = re.compile(r"(?m)^\s*---\s*$")
+_PAGE_TYPE_RE = re.compile(
+    r"(?im)^\s*<!--\s*page_type\s*:\s*(cover|chapter|transition|toc|content|ending)\s*-->\s*"
+)
+_HEADING_RE = re.compile(r"(?m)^#{1,3}\s+(.+?)\s*$")
+
+PageType = str
+DEFAULT_AUTO_SLIDE_RANGE = (16, 24)
+DETAIL_AUTO_SLIDE_RANGES = {
+    "normal": (16, 24),
+    "high": (22, 34),
+    "very_high": (28, 44),
+}
+
+
+def split_manuscript_pages(manuscript: str) -> list[str]:
+    """Split manuscript Markdown on standalone slide delimiter lines only."""
+    normalized = normalize_manuscript_slide_delimiters(manuscript)
+    return [page.strip() for page in _SLIDE_DELIMITER_RE.split(normalized) if page.strip()]
+
+
+def normalize_manuscript_slide_delimiters(manuscript: str) -> str:
+    """Restore slide delimiters when page_type markers already define page starts.
+
+    Some OpenAI-compatible models occasionally keep the `<!-- page_type: ... -->`
+    markers but omit most `---` slide separators. In that case the manuscript is
+    semantically multi-page, but delimiter-only parsing collapses it into a few
+    giant pages. This repair is intentionally structural: it never edits slide
+    text, only inserts standard delimiters between page_type blocks.
+    """
+    text = manuscript.strip()
+    markers = list(_PAGE_TYPE_RE.finditer(text))
+    if len(markers) <= 1:
+        return text
+
+    delimiter_pages = [page.strip() for page in _SLIDE_DELIMITER_RE.split(text) if page.strip()]
+    delimiters_already_valid = (
+        len(delimiter_pages) == len(markers)
+        and all(_PAGE_TYPE_RE.search(page) for page in delimiter_pages)
+    )
+    if delimiters_already_valid:
+        return text
+
+    prefix = text[: markers[0].start()].strip()
+    pages: list[str] = []
+    if prefix:
+        pages.append(prefix)
+    for index, marker in enumerate(markers):
+        start = marker.start()
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+        page = text[start:end].strip()
+        page = _SLIDE_DELIMITER_RE.sub("", page).strip()
+        if page:
+            pages.append(page)
+    return "\n\n---\n\n".join(pages)
+
+
+def count_manuscript_pages(manuscript: str) -> int:
+    """Return the number of actual slide pages in a manuscript."""
+    return len(split_manuscript_pages(manuscript))
+
+
+def normalize_page_type(page_type: str | None) -> PageType:
+    value = (page_type or "").strip().lower()
+    if value == "transition":
+        return "chapter"
+    if value in {"cover", "chapter", "toc", "content", "ending"}:
+        return value
+    return "content"
+
+
+def extract_page_type(page_content: str) -> PageType:
+    """Read non-visible page type metadata from a manuscript page."""
+    match = _PAGE_TYPE_RE.search(page_content)
+    if match:
+        return normalize_page_type(match.group(1))
+    return "content"
+
+
+def strip_page_type_metadata(page_content: str) -> str:
+    """Remove page type metadata before sending content to visual rendering."""
+    return _PAGE_TYPE_RE.sub("", page_content, count=1).strip()
+
+
+def page_title(page_content: str) -> str:
+    content = strip_page_type_metadata(page_content)
+    match = _HEADING_RE.search(content)
+    if match:
+        return match.group(1).strip()
+    first = next((line.strip() for line in content.splitlines() if line.strip()), "")
+    return first[:80] or "Untitled"
+
+
+def auto_slide_range(detail_level: str = "normal") -> tuple[int, int]:
+    return DETAIL_AUTO_SLIDE_RANGES.get(detail_level, DEFAULT_AUTO_SLIDE_RANGE)
+
+
+def page_type_budget(
+    num_pages: int | None,
+    detail_level: str = "normal",
+) -> dict[PageType, int]:
+    """Return the structural slide budget included in the total slide count."""
+    if not num_pages:
+        min_pages, _max_pages = auto_slide_range(detail_level)
+        chapter_count = {
+            "normal": 3,
+            "high": 4,
+            "very_high": 5,
+        }.get(detail_level, 3)
+        return {
+            "cover": 1,
+            "toc": 1,
+            "chapter": chapter_count,
+            "content": max(1, min_pages - 3 - chapter_count),
+            "ending": 1,
+        }
+    if num_pages <= 1:
+        return {"cover": 0, "toc": 0, "chapter": 0, "content": 1, "ending": 0}
+    if num_pages == 2:
+        return {"cover": 1, "toc": 1, "chapter": 0, "content": 0, "ending": 0}
+    if num_pages == 3:
+        return {"cover": 1, "toc": 1, "chapter": 0, "content": 1, "ending": 0}
+
+    chapter_count = 0
+    if num_pages >= 30:
+        chapter_count = 5
+    elif num_pages >= 18:
+        chapter_count = 4
+    elif num_pages >= 12:
+        chapter_count = 3
+    elif num_pages >= 9:
+        chapter_count = 2
+    elif num_pages >= 5:
+        chapter_count = 1
+
+    content_count = max(1, num_pages - 3 - chapter_count)
+    return {
+        "cover": 1,
+        "toc": 1,
+        "chapter": chapter_count,
+        "content": content_count,
+        "ending": 1,
+    }
+
+
+def page_type_budget_guidance(
+    num_pages: int | None,
+    detail_level: str = "normal",
+) -> str:
+    budget = page_type_budget(num_pages, detail_level)
+    if num_pages:
+        lead = f"Produce exactly {num_pages} slides total; reserve structural pages separately when planning content."
+    else:
+        min_pages, max_pages = auto_slide_range(detail_level)
+        lead = f"Choose {min_pages}-{max_pages} total slides; reserve structural pages separately when planning content."
+        return (
+            f"{lead}\n"
+            "- The table of contents is mandatory and must be slide 2, immediately after the cover. Its chapter titles must match the final chapter plan.\n"
+            f"- Chapter count ceiling: use at most {budget['chapter']} chapter/transition slide(s).\n"
+            "- Chapter granularity: chapters are presentation-level sections, not paper subsection headings. Put local method parts, result groups, and discussion points on content slides.\n"
+            "- Planning: count structural pages separately and use the remaining content-slide budget to choose chapter boundaries.\n"
+            "- Put `<!-- page_type: cover|toc|chapter|content|ending -->` at the top of every slide.\n"
+            "- Never put a `---` delimiter immediately after a page_type metadata line; the slide content must follow the metadata line, and `---` appears only between complete slides.\n"
+            "- Cover, table-of-contents, chapter/transition, and ending pages are structural slides: count them in the total, but not in the content-slide budget.\n"
+            "- Cover pages are lightweight title/meta slides: title, optional subtitle, paper metadata (authors/source/venue/date when available), and a few short context or thesis lines. Do not insert paper figures or turn the cover into a detailed content slide.\n"
+            "- Chapter/ending pages are minimal structural slides: no bullets, numbered question lists, metrics/KPI blocks, paper figures, or labeled blocks such as `核心问题` / `本章看点`.\n"
+            "- Keep all chapter/transition pages in the same shape: chapter title plus optional short subtitle/orientation phrase only.\n"
+            "- The ending page is a closing/thanks slide, not another content summary."
+        )
+    return (
+        f"{lead}\n"
+        f"- Planning budget: cover {budget['cover']}, table of contents {budget['toc']}, up to {budget['chapter']} chapter/transition slide(s), "
+        f"content about {budget['content']}, ending {budget['ending']}. Use the content-slide budget, not the structural slides, to decide chapter count.\n"
+        "- The table of contents is mandatory and must be slide 2, immediately after the cover. Its chapter titles must match the final chapter plan.\n"
+        f"- Chapter count ceiling: use at most {budget['chapter']} chapter/transition slide(s).\n"
+        "- Chapter granularity: chapters are presentation-level sections, not paper subsection headings. Put local method parts, result groups, and discussion points on content slides.\n"
+        "- Planning: count structural pages separately and use the remaining content-slide budget to choose chapter boundaries.\n"
+        "- Put `<!-- page_type: cover|toc|chapter|content|ending -->` at the top of every slide.\n"
+        "- Never put a `---` delimiter immediately after a page_type metadata line; the slide content must follow the metadata line, and `---` appears only between complete slides.\n"
+        "- Cover, table-of-contents, chapter/transition, and ending pages are structural slides: count them in the total, but not in the content-slide budget.\n"
+        "- Cover pages are lightweight title/meta slides: title, optional subtitle, paper metadata (authors/source/venue/date when available), and a few short context or thesis lines. Do not insert paper figures or turn the cover into a detailed content slide.\n"
+        "- Chapter/ending pages are minimal structural slides: no bullets, numbered question lists, metrics/KPI blocks, paper figures, or labeled blocks such as `核心问题` / `本章看点`.\n"
+        "- Keep all chapter/transition pages in the same shape: chapter title plus optional short subtitle/orientation phrase only.\n"
+        "- The ending page is a closing/thanks slide, not another content summary."
+    )
+
+
+def page_inventory(manuscript: str) -> list[dict[str, str | int]]:
+    pages = split_manuscript_pages(manuscript)
+    return [
+        {"page": index, "type": extract_page_type(page), "title": page_title(page)}
+        for index, page in enumerate(pages, start=1)
+    ]
+
+
+def format_page_inventory(manuscript: str) -> str:
+    lines = []
+    for item in page_inventory(manuscript):
+        lines.append(f"{item['page']}. [{item['type']}] {item['title']}")
+    return "\n".join(lines)
